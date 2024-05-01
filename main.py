@@ -1,72 +1,106 @@
 import os
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, render_template_string
 import qrcode
+import boto3
+from werkzeug.utils import secure_filename
+from dotenv import load_dotenv
+
+# Load environment variables from .env
+load_dotenv()
 
 app = Flask(__name__)
 
-# Define a folder for temporary storage of PDFs and QR codes
-UPLOAD_FOLDER = 'uploads'
+# AWS configuration
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_KEY")
+AWS_BUCKET_NAME = "pdftoqr"
+
+# S3 client configuration
+s3 = boto3.client(
+    "s3",
+    aws_access_key_id=AWS_ACCESS_KEY_ID,
+    aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+)
+
+# Temporary storage folder
+UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-@app.route('/')
+@app.route("/")
 def index():
-    # Form to upload PDFs
     return '''
     <form method="post" enctype="multipart/form-data" action="/upload">
-        <input type="file" name="pdf">
+        <input type="file" name="pdf" required>
         <input type="submit" value="Upload PDF">
     </form>
     '''
 
-@app.route('/upload', methods=['POST'])
+@app.route("/upload", methods=["POST"])
 def upload():
-    if 'pdf' not in request.files:
+    if "pdf" not in request.files:
         return "No file part"
     
-    pdf_file = request.files['pdf']
-    if pdf_file.filename == '':
+    pdf_file = request.files["pdf"]
+    if pdf_file.filename == "":
         return "No selected file"
     
-    # Get the base file name without extension
-    base_filename = os.path.splitext(pdf_file.filename)[0]
+    # Secure filename to avoid path traversal
+    filename = secure_filename(pdf_file.filename)
     
-    # Save the uploaded PDF
-    pdf_path = os.path.join(UPLOAD_FOLDER, pdf_file.filename)
-    pdf_file.save(pdf_path)
+    # Upload the PDF to S3
+    s3.upload_fileobj(pdf_file, AWS_BUCKET_NAME, filename)
     
-    # Create a URL for the PDF download
-    pdf_url = request.host_url + "download-pdf/" + pdf_file.filename
+    # Generate a URL to download the PDF from S3
+    pdf_url = f"https://{AWS_BUCKET_NAME}.s3.amazonaws.com/{filename}"
     
-    # Generate a QR code with the URL for the PDF
+    # Generate a QR code with the URL to the PDF
     qr = qrcode.make(pdf_url)
     
-    # Name the QR code file using the base file name + "_QR.png"
-    qr_filename = f"{base_filename}_QR.png"
+    # Save the QR code and upload it to S3
+    qr_filename = f"{os.path.splitext(filename)[0]}_QR.png"
     qr_path = os.path.join(UPLOAD_FOLDER, qr_filename)
     qr.save(qr_path)
     
-    # Provide a link to download the QR code
+    s3.upload_file(qr_path, AWS_BUCKET_NAME, qr_filename)
+    
+    # Return download links and the QR code image
     return f'''
-    <p>PDF uploaded! <a href="{pdf_url}">Download PDF</a></p>
-    <p><a href="/download-qr-code/{qr_filename}">Download QR Code</a></p>
+    <p>PDF and QR code uploaded! 
+    <a href="/download-pdf/{filename}">Download PDF</a> 
+    | 
+    <a href="/download-qr-code/{qr_filename}">Download QR Code</a>
+    </p>
     <img src="/view-qr-code/{qr_filename}" alt="QR Code" />
     '''
 
-@app.route('/view-qr-code/<qr_filename>')
-def view_qr_code(qr_filename):
-    # Return the QR code image for viewing
-    return send_file(os.path.join(UPLOAD_FOLDER, qr_filename))
-
-@app.route('/download-qr-code/<qr_filename>')
-def download_qr_code(qr_filename):
-    # Serve the QR code for download
-    return send_file(os.path.join(UPLOAD_FOLDER, qr_filename), as_attachment=True)
-
-@app.route('/download-pdf/<filename>')
+@app.route("/download-pdf/<filename>")
 def download_pdf(filename):
-    # Serve the PDF for download
-    pdf_path = os.path.join(UPLOAD_FOLDER, filename)
-    return send_file(pdf_path, as_attachment=True)
+    # Download the PDF from S3 and serve it
+    local_path = os.path.join(UPLOAD_FOLDER, filename)
+    s3.download_file(AWS_BUCKET_NAME, filename, local_path)
+    return send_file(
+        local_path,
+        as_attachment=True,
+        download_name=filename
+    )
+
+@app.route("/download-qr-code/<qr_filename>")
+def download_qr_code(qr_filename):
+    # Download the QR code from S3 and serve it
+    local_path = os.path.join(UPLOAD_FOLDER, qr_filename)
+    s3.download_file(AWS_BUCKET_NAME, qr_filename, local_path)
+    return send_file(
+        local_path,
+        as_attachment=True,
+        download_name=qr_filename
+    )
+
+@app.route("/view-qr-code/<qr_filename>")
+def view_qr_code(qr_filename):
+    # Serve the QR code image for viewing
+    local_path = os.path.join(UPLOAD_FOLDER, qr_filename)
+    s3.download_file(AWS_BUCKET_NAME, qr_filename, local_path)
+    return send_file(local_path, mimetype="image/png")
 
 if __name__ == '__main__':
     app.run(debug=True)
